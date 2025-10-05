@@ -86,6 +86,7 @@ def geocode_location(location_name, api_key=None):
         except Exception as e:
             st.warning(f"⚠️ {service_name} geocoding failed: {str(e)}")
             continue
+    
     return None, "❌ Could not find location. Please try a different search term."
 
 # -------------------------------
@@ -253,24 +254,162 @@ def create_weather_summary_cards(df):
         avg_wind = df['Wind Speed (m/s)'].mean()
         st.metric("💨 Max Wind Speed", f"{max_wind:.1f}m/s", f"{avg_wind:.1f}m/s avg")
 
+def create_interactive_charts(df):
+    """Create interactive weather charts"""
+    if df.empty:
+        return
+    
+    # Temperature and Humidity Chart
+    fig1 = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Temperature Trend', 'Humidity Trend'),
+        vertical_spacing=0.1
+    )
+    
+    fig1.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Temperature (°C)'],
+            mode='lines+markers',
+            name='Temperature',
+            line=dict(color='#FF6B6B', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.1f}°C<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    fig1.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Humidity (%)'],
+            mode='lines+markers',
+            name='Humidity',
+            line=dict(color='#4ECDC4', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.1f}%<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    
+    fig1.update_layout(
+        height=500,
+        showlegend=True,
+        hovermode='x unified',
+        title="Temperature and Humidity Trends"
+    )
+    
+    st.plotly_chart(fig1, use_container_width=True)
+    
+    # Wind and Precipitation Chart
+    fig2 = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Wind Speed', 'Precipitation'),
+        vertical_spacing=0.1
+    )
+    
+    fig2.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Wind Speed (m/s)'],
+            mode='lines+markers',
+            name='Wind Speed',
+            line=dict(color='#45B7D1', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.2f} m/s<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    fig2.add_trace(
+        go.Bar(
+            x=df['Date'], 
+            y=df['Precipitation (mm)'],
+            name='Precipitation',
+            marker_color='#96CEB4',
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.2f} mm<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    
+    fig2.update_layout(
+        height=500,
+        showlegend=True,
+        hovermode='x unified',
+        title="Wind Speed and Precipitation"
+    )
+    
+    st.plotly_chart(fig2, use_container_width=True)
+
+def create_weather_insights(df, location_name="this location"):
+    """Generate weather insights and recommendations"""
+    if df.empty:
+        return
+    
+    st.subheader("🔍 Weather Insights & Recommendations")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**📊 Weather Analysis**")
+        
+        # Temperature analysis
+        temp_trend = "increasing" if df["Temperature (°C)"].iloc[-1] > df["Temperature (°C)"].iloc[0] else "decreasing"
+        temp_change = abs(df["Temperature (°C)"].iloc[-1] - df["Temperature (°C)"].iloc[0])
+        st.write(f"• Temperature trend: **{temp_trend}** by {temp_change:.1f}°C over the period")
+        
+        # Precipitation analysis
+        rainy_days = (df["Precipitation (mm)"] > 1).sum()
+        heavy_rain_days = (df["Precipitation (mm)"] > 10).sum()
+        st.write(f"• Expected rainy days: **{rainy_days}** out of {len(df)} days")
+        if heavy_rain_days > 0:
+            st.write(f"• Heavy rain expected: **{heavy_rain_days}** days")
+        
+        # Wind analysis
+        windy_days = (df["Wind Speed (m/s)"] > 5).sum()
+        very_windy_days = (df["Wind Speed (m/s)"] > 10).sum()
+        st.write(f"• Windy days: **{windy_days}** days")
+        if very_windy_days > 0:
+            st.write(f"• Very windy days: **{very_windy_days}** days")
+    
+    with col2:
+        st.markdown("**💡 Recommendations**")
+        
+        # Temperature recommendations
+        avg_temp = df["Temperature (°C)"].mean()
+        if avg_temp > 30:
+            st.write("• 🌡️ **Hot weather expected** - Stay hydrated and avoid outdoor activities during peak hours")
+        elif avg_temp < 10:
+            st.write("• 🧥 **Cold weather expected** - Dress warmly and be prepared for low temperatures")
+        else:
+            st.write("• 🌤️ **Moderate temperatures** - Pleasant weather conditions expected")
+        
+        # Precipitation recommendations
+        if rainy_days > len(df) * 0.3:
+            st.write("• ☔ **Frequent rain expected** - Keep umbrellas and rain gear handy")
+        elif rainy_days > 0:
+            st.write("• 🌦️ **Some rain expected** - Check weather before outdoor plans")
+        else:
+            st.write("• ☀️ **Dry period expected** - Good time for outdoor activities")
+        
+        # Wind recommendations
+        if very_windy_days > 0:
+            st.write("• 💨 **Strong winds expected** - Secure outdoor items and avoid high-altitude activities")
+        elif windy_days > len(df) * 0.3:
+            st.write("• 🌬️ **Frequent windy conditions** - Consider wind when planning outdoor activities")
+
 # -------------------------------
 # Main App
 # -------------------------------
 def main():
     st.title("🌦️ RainCheck - Interactive Weather Forecast")
+    
     if CLOUD_MODE:
-        st.info("🌐 Cloud Mode: Using intelligent fallback forecasting")
+        st.info("🌐 **Cloud Mode**: Using intelligent fallback forecasting (No API required)")
     else:
-        st.info("🏠 Local Mode: Real-time API-based forecast")
+        st.info("🏠 **Local Mode**: Real-time API-based forecast")
     
-    if not check_api_status() and not CLOUD_MODE:
-        st.error("⚠️ API server not running. Start with `uvicorn api:app --reload`")
-        if st.button("🔄 Continue with Fallback Mode"):
-            st.session_state['use_fallback'] = True
-            st.rerun()
-        else:
-            st.stop()
-    
+    # Always allow the app to run - no API dependency
     st.sidebar.header("⚙️ Configuration")
     st.sidebar.info("🌐 Cloud Mode" if CLOUD_MODE else "🏠 Local Mode with API")
     forecast_days = st.sidebar.selectbox("Forecast Period", [7, 29], index=1)
@@ -284,21 +423,64 @@ def main():
     if lat is not None and lon is not None:
         st.markdown("---")
         st.subheader(f"🌤️ {forecast_days}-Day Weather Forecast for {location_name}")
-        with st.spinner(f"Fetching forecast for {location_name}..."):
+        
+        with st.spinner(f"Generating forecast for {location_name}..."):
             df, error = fetch_weather_forecast(lat, lon, forecast_days)
+        
         if error:
             st.error(error)
         else:
             create_weather_summary_cards(df)
+            
             if show_charts:
-                st.subheader("📈 Interactive Charts")
-                # charts function can be added here
+                st.subheader("📈 Interactive Weather Charts")
+                create_interactive_charts(df)
+            
             if show_insights:
-                st.subheader("🔍 Weather Insights & Recommendations")
-                # insights function can be added here
+                create_weather_insights(df, location_name)
+            
             if show_raw_data:
                 st.subheader("📋 Raw Forecast Data")
-                st.dataframe(df)
+                st.dataframe(
+                    df.style.format({
+                        'Temperature (°C)': '{:.1f}',
+                        'Humidity (%)': '{:.1f}',
+                        'Wind Speed (m/s)': '{:.2f}',
+                        'Precipitation (mm)': '{:.2f}'
+                    }),
+                    use_container_width=True
+                )
+            
+            # Download Options
+            st.subheader("📥 Download Forecast Data")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📊 Download as CSV",
+                    data=csv,
+                    file_name=f"weather_forecast_{location_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+            
+            with col2:
+                json_data = df.to_json(orient='records', date_format='iso')
+                st.download_button(
+                    label="📄 Download as JSON",
+                    data=json_data,
+                    file_name=f"weather_forecast_{location_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+    else:
+        st.info("👆 Please search for a location above to get started with weather forecasting!")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "**RainCheck Weather Forecast** | Powered by Intelligent Forecasting | "
+        f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
 if __name__ == "__main__":
     main()

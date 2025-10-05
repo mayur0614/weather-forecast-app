@@ -11,22 +11,17 @@ plotly>=5.15.0
 folium>=0.14.0
 streamlit-folium>=0.13.0
 
-# Machine Learning & Deep Learning
+# Machine Learning & Deep Learning (optional for cloud deployment)
 tensorflow>=2.13.0
 scikit-learn>=1.3.0
 
 # Data Processing
 joblib>=1.3.0
 
-# API Framework
+# API Framework (optional for local development)
 fastapi>=0.103.0
 uvicorn[standard]>=0.23.0
 
 # Additional Utilities
 python-multipart>=0.0.6
 pydantic>=2.0.0
-
-# Development Dependencies (optional)
-pytest>=7.4.0
-black>=23.0.0
-flake8>=6.0.0
