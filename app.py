@@ -2,448 +2,614 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Attention
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from tensorflow.keras.optimizers import Adam
-import joblib
 import requests
+import json
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import folium
+from streamlit_folium import st_folium
 import warnings
 warnings.filterwarnings('ignore')
 
 # -------------------------------
-# Fetch NASA POWER daily data
+# Configuration
 # -------------------------------
-def fetch_nasa_data(lat, lon, start="20100101", end="20241231"):
-    url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+API_BASE_URL = "http://localhost:8000"  # Change this to your API URL
+st.set_page_config(
+    page_title="🌦️ RainCheck Weather Forecast",
+    page_icon="🌦️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -------------------------------
+# Location Search Functions
+# -------------------------------
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def geocode_location(location_name, api_key=None):
+    """Geocode location using multiple services"""
+    if not location_name or location_name.strip() == "":
+        return None, "Please enter a location name"
+    
+    # Try multiple geocoding services
+    services = []
+    
+    # 1. OpenStreetMap Nominatim (free, no API key required)
+    services.append(("OpenStreetMap", geocode_nominatim))
+    
+    # 2. Google Geocoding API (if API key provided)
+    if api_key:
+        services.append(("Google Maps", lambda loc: geocode_google(loc, api_key)))
+    
+    for service_name, service_func in services:
+        try:
+            result = service_func(location_name)
+            if result and result.get('lat') and result.get('lon'):
+                return result, None
+        except Exception as e:
+            st.warning(f"⚠️ {service_name} geocoding failed: {str(e)}")
+            continue
+    
+    return None, "❌ Could not find location. Please try a different search term or check your spelling."
+
+def geocode_nominatim(location_name):
+    """Geocode using OpenStreetMap Nominatim (free)"""
+    url = "https://nominatim.openstreetmap.org/search"
     params = {
-        "start": start,
-        "end": end,
-        "latitude": lat,
-        "longitude": lon,
-        "parameters": "T2M,RH2M,WS10M,PRECTOTCORR,PS,ALLSKY_SFC_SW_DWN,T2M_MAX,T2M_MIN,WS2M",
-        "community": "AG",
-        "format": "JSON"
+        "q": location_name,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 1
     }
-    r = requests.get(url, params=params)
-    data_json = r.json()
-    if "properties" not in data_json or "parameter" not in data_json["properties"]:
-        return pd.DataFrame()
+    headers = {
+        "User-Agent": "RainCheck Weather App"
+    }
+    
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    if response.status_code == 200:
+        data = response.json()
+        if data:
+            location = data[0]
+            return {
+                'lat': float(location['lat']),
+                'lon': float(location['lon']),
+                'display_name': location['display_name'],
+                'address': location.get('address', {}),
+                'service': 'OpenStreetMap'
+            }
+    return None
 
-    data = data_json["properties"]["parameter"]
-    df = pd.DataFrame({
-        "date": list(data["T2M"].keys()),
-        "Temperature (°C)": list(data["T2M"].values()),
-        "Humidity (%)": list(data["RH2M"].values()),
-        "Wind Speed (m/s)": list(data["WS10M"].values()),
-        "Precipitation (mm)": list(data["PRECTOTCORR"].values()),
-        "Pressure (Pa)": list(data["PS"].values()),
-        "Solar Radiation (W/m²)": list(data["ALLSKY_SFC_SW_DWN"].values()),
-        "Max Temperature (°C)": list(data["T2M_MAX"].values()),
-        "Min Temperature (°C)": list(data["T2M_MIN"].values()),
-        "Wind Speed 2m (m/s)": list(data["WS2M"].values())
-    })
-    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors='coerce')
-    # Remove any rows with invalid dates
-    df = df.dropna(subset=['date'])
-    df.sort_values("date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+def geocode_google(location_name, api_key):
+    """Geocode using Google Maps API"""
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {
+        "address": location_name,
+        "key": api_key
+    }
+    
+    response = requests.get(url, params=params, timeout=10)
+    if response.status_code == 200:
+        data = response.json()
+        if data['status'] == 'OK' and data['results']:
+            result = data['results'][0]
+            location = result['geometry']['location']
+            return {
+                'lat': location['lat'],
+                'lon': location['lng'],
+                'display_name': result['formatted_address'],
+                'address': result.get('address_components', []),
+                'service': 'Google Maps'
+            }
+    return None
 
-# -------------------------------
-# Feature Engineering - Simplified and More Accurate
-# -------------------------------
-def add_temporal_features(df):
-    """Add essential temporal features without overcomplicating"""
-    df = df.copy()
-    
-    # Basic temporal features
-    df['day_of_year'] = df['date'].dt.dayofyear
-    df['month'] = df['date'].dt.month
-    df['day_of_week'] = df['date'].dt.dayofweek
-    
-    # Seasonal features (most important for weather)
-    df['sin_day_of_year'] = np.sin(2 * np.pi * df['day_of_year'] / 365.25)
-    df['cos_day_of_year'] = np.cos(2 * np.pi * df['day_of_year'] / 365.25)
-    
-    # Temperature range (important for weather patterns)
-    if 'Max Temperature (°C)' in df.columns and 'Min Temperature (°C)' in df.columns:
-        df['temp_range'] = df['Max Temperature (°C)'] - df['Min Temperature (°C)']
-    
-    # Simple lag features (only 1-2 days to avoid overfitting)
-    for col in ['Temperature (°C)', 'Humidity (%)', 'Wind Speed (m/s)', 'Precipitation (mm)']:
-        if col in df.columns:
-            df[f'{col}_lag1'] = df[col].shift(1)
-            df[f'{col}_lag2'] = df[col].shift(2)
-    
-    # Simple rolling mean (3-day to capture short-term trends)
-    for col in ['Temperature (°C)', 'Humidity (%)', 'Wind Speed (m/s)']:
-        if col in df.columns:
-            df[f'{col}_3d_mean'] = df[col].rolling(window=3, min_periods=1).mean()
-    
-    # Fill NaN values
-    df = df.fillna(method='bfill').fillna(method='ffill')
-    
-    return df
-
-# -------------------------------
-# Create sequences
-# -------------------------------
-def create_sequences(data, past_days=30, future_days=30):
-    X, y = [], []
-    for i in range(len(data) - past_days - future_days):
-        X.append(data[i:i+past_days])
-        y.append(data[i+past_days:i+past_days+future_days])
-    return np.array(X), np.array(y)
-
-# -------------------------------
-# Train Accurate LSTM Model
-# -------------------------------
-def train_lstm(df):
-    # Focus only on core weather parameters for accuracy
-    core_features = ["Temperature (°C)", "Humidity (%)", "Wind Speed (m/s)", "Precipitation (mm)"]
-    
-    # Add minimal temporal features
-    df_enhanced = add_temporal_features(df)
-    
-    # Select only essential features to avoid overfitting
-    essential_features = core_features + ['day_of_year', 'sin_day_of_year', 'cos_day_of_year']
-    
-    # Filter to only include features that exist in the dataframe
-    feature_cols = [col for col in essential_features if col in df_enhanced.columns]
-    
-    # Use MinMaxScaler for better weather prediction (keeps values in realistic ranges)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(df_enhanced[feature_cols])
-    
-    # Create sequences with shorter lookback for better accuracy
-    X, y = create_sequences(scaled, past_days=14, future_days=7)  # Shorter sequences for accuracy
-
-    # Simple train/val split
-    split = int(len(X) * 0.8)
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
-
-    # Simplified but effective LSTM architecture
-    model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(14, len(feature_cols))),
-        Dropout(0.2),
-        LSTM(32, return_sequences=True),
-        Dropout(0.2),
-        LSTM(16),
-        Dropout(0.1),
-        Dense(32, activation='relu'),
-        Dense(7 * len(feature_cols))  # Predict 7 days instead of 30
-    ])
-    
-    # Simpler optimizer
-    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-    
-    # Basic callbacks
-    callbacks = [
-        EarlyStopping(patience=10, restore_best_weights=True, monitor='val_loss'),
-        ReduceLROnPlateau(factor=0.5, patience=5, min_lr=1e-6, monitor='val_loss')
-    ]
-    
-    # Train with fewer epochs but better validation
-    history = model.fit(
-        X_train, y_train.reshape(y_train.shape[0], -1),
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val.reshape(y_val.shape[0], -1)),
-        callbacks=callbacks,
-        verbose=1
+def create_location_map(lat, lon, location_name="Selected Location", zoom=10):
+    """Create an interactive map for location selection"""
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=zoom,
+        tiles='OpenStreetMap'
     )
     
-    # Calculate metrics only for core weather features
-    val_pred = model.predict(X_val)
-    val_pred = val_pred.reshape(y_val.shape[0], -1)
-    y_val_flat = y_val.reshape(y_val.shape[0], -1)
+    # Add marker for the location
+    folium.Marker(
+        [lat, lon],
+        popup=f"<b>{location_name}</b><br>Lat: {lat:.4f}<br>Lon: {lon:.4f}",
+        tooltip=location_name,
+        icon=folium.Icon(color='red', icon='cloud', prefix='fa')
+    ).add_to(m)
     
-    metrics = {}
-    for i, col in enumerate(feature_cols):
-        if i < val_pred.shape[1]:
-            mae = mean_absolute_error(y_val_flat[:, i], val_pred[:, i])
-            mse = mean_squared_error(y_val_flat[:, i], val_pred[:, i])
-            r2 = r2_score(y_val_flat[:, i], val_pred[:, i])
-            metrics[col] = {'MAE': mae, 'MSE': mse, 'R2': r2}
+    # Add a circle to show the area
+    folium.Circle(
+        [lat, lon],
+        radius=5000,  # 5km radius
+        popup="Weather forecast area",
+        color="blue",
+        fill=True,
+        fillColor="lightblue",
+        fillOpacity=0.2
+    ).add_to(m)
     
-    # Save model and scaler
-    joblib.dump(scaler, "scaler.pkl")
-    joblib.dump(feature_cols, "feature_cols.pkl")
-    model.save("rain_lstm_model.h5")
-    
-    return model, scaler, feature_cols, metrics, history
+    return m
 
 # -------------------------------
-# Predict next 7 days (more accurate)
+# API Integration Functions
 # -------------------------------
-def predict_next_7days(model, scaler, df, feature_cols):
-    """Predict next 7 days with better accuracy"""
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def fetch_weather_forecast(lat, lon, days=29):
+    """Fetch weather forecast from API"""
     try:
-        # Add temporal features to recent data
-        df_enhanced = add_temporal_features(df)
+        if days == 7:
+            endpoint = f"{API_BASE_URL}/forecast/7days"
+        else:
+            endpoint = f"{API_BASE_URL}/forecast/29days"
         
-        # Scale the enhanced features
-        scaled = scaler.transform(df_enhanced[feature_cols])
+        params = {"lat": lat, "lon": lon}
+        response = requests.get(endpoint, params=params, timeout=30)
         
-        # Get last 14 days for prediction (matching training)
-        last_14 = scaled[-14:].reshape(1, 14, len(feature_cols))
-        pred_scaled = model.predict(last_14)
-        pred_scaled = pred_scaled.reshape(7, len(feature_cols))  # 7 days prediction
-        
-        # Inverse transform predictions
-        preds = scaler.inverse_transform(pred_scaled)
-        
-        # Create prediction dataframe with robust date handling
-        last_date = df["date"].iloc[-1]
-        if pd.isna(last_date):
-            # Fallback to current date if last date is NaT
-            last_date = datetime.now()
-        
-        # Ensure we have a valid datetime
-        if not isinstance(last_date, pd.Timestamp):
-            last_date = pd.Timestamp(last_date)
-        
-        future_dates = pd.date_range(last_date + timedelta(days=1), 
-                                     periods=7, freq="D")
-        df_pred = pd.DataFrame(preds, columns=feature_cols)
-        df_pred["Date"] = future_dates
-        
-        # Apply realistic constraints to predictions
-        df_pred = apply_weather_constraints(df_pred)
-        
-        # Select only the main weather parameters for display
-        main_features = ["Temperature (°C)", "Humidity (%)", "Wind Speed (m/s)", "Precipitation (mm)"]
-        display_features = [col for col in main_features if col in df_pred.columns]
-        
-        return df_pred[["Date"] + display_features], df_pred
-        
+        if response.status_code == 200:
+            data = response.json()
+            df = pd.DataFrame(data)
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+            return df, None
+        else:
+            error_msg = f"API Error {response.status_code}: {response.text}"
+            return pd.DataFrame(), error_msg
+            
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), "❌ Cannot connect to API. Please ensure the API server is running on " + API_BASE_URL
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "❌ API request timed out. Please try again."
     except Exception as e:
-        print(f"Error in prediction: {e}")
-        # Return empty dataframe with proper structure
-        empty_df = pd.DataFrame(columns=["Date", "Temperature (°C)", "Humidity (%)", "Wind Speed (m/s)", "Precipitation (mm)"])
-        return empty_df, empty_df
+        return pd.DataFrame(), f"❌ Error: {str(e)}"
 
-def apply_weather_constraints(df_pred):
-    """Apply realistic weather constraints to predictions"""
-    df = df_pred.copy()
-    
-    # Temperature constraints (realistic ranges)
-    if 'Temperature (°C)' in df.columns:
-        df['Temperature (°C)'] = np.clip(df['Temperature (°C)'], -50, 60)
-    
-    # Humidity constraints (0-100%)
-    if 'Humidity (%)' in df.columns:
-        df['Humidity (%)'] = np.clip(df['Humidity (%)'], 0, 100)
-    
-    # Wind speed constraints (0-50 m/s)
-    if 'Wind Speed (m/s)' in df.columns:
-        df['Wind Speed (m/s)'] = np.clip(df['Wind Speed (m/s)'], 0, 50)
-    
-    # Precipitation constraints (0-200 mm/day)
-    if 'Precipitation (mm)' in df.columns:
-        df['Precipitation (mm)'] = np.clip(df['Precipitation (mm)'], 0, 200)
-    
-    return df
-
-# -------------------------------
-# Predict next 30 days (using 7-day model iteratively)
-# -------------------------------
-def predict_next_30days(model, scaler, df, feature_cols):
-    """Predict 30 days by iteratively using 7-day predictions"""
+def check_api_status():
+    """Check if API is running"""
     try:
-        all_predictions = []
-        current_df = df.copy()
-        
-        # Predict 30 days in 7-day chunks
-        for i in range(5):  # 5 * 7 = 35 days, we'll take first 30
-            # Get 7-day prediction
-            pred_7d, _ = predict_next_7days(model, scaler, current_df, feature_cols)
-            
-            # Check if prediction is valid
-            if pred_7d.empty:
-                print(f"Warning: Empty prediction at iteration {i}")
-                break
-            
-            # Add predictions to our list
-            all_predictions.append(pred_7d)
-            
-            # Update current_df with the last few days of predictions for next iteration
-            if i < 4:  # Don't do this on the last iteration
-                # Create a new row for the next iteration
-                last_pred = pred_7d.iloc[-1].copy()
-                last_pred['Date'] = pred_7d['Date'].iloc[-1]
-                
-                # Add to current_df for next prediction
-                new_row = pd.DataFrame([last_pred])
-                current_df = pd.concat([current_df, new_row], ignore_index=True)
-        
-        # Combine all predictions
-        if all_predictions:
-            df_30d = pd.concat(all_predictions, ignore_index=True)
-            # Take only first 30 days
-            df_30d = df_30d.head(30)
-            return df_30d, df_30d
-        else:
-            # Return empty dataframe if no valid predictions
-            empty_df = pd.DataFrame(columns=["Date", "Temperature (°C)", "Humidity (%)", "Wind Speed (m/s)", "Precipitation (mm)"])
-            return empty_df, empty_df
-            
-    except Exception as e:
-        print(f"Error in 30-day prediction: {e}")
-        # Return empty dataframe with proper structure
-        empty_df = pd.DataFrame(columns=["Date", "Temperature (°C)", "Humidity (%)", "Wind Speed (m/s)", "Precipitation (mm)"])
-        return empty_df, empty_df
+        response = requests.get(f"{API_BASE_URL}/docs", timeout=5)
+        return response.status_code == 200
+    except:
+        return False
 
 # -------------------------------
-# Streamlit UI
+# UI Components
 # -------------------------------
-st.title("🌦️ RainCheck - Accurate Weather Forecast")
-st.markdown("**Simplified LSTM model focused on core weather parameters for realistic predictions**")
-
-# Sidebar for model configuration
-st.sidebar.header("Model Configuration")
-past_days = st.sidebar.slider("Lookback Days", 15, 60, 30, help="Number of past days to consider for prediction")
-future_days = st.sidebar.slider("Prediction Days", 7, 30, 30, help="Number of future days to predict")
-
-# Main input
-col1, col2 = st.columns(2)
-with col1:
-    lat = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=19.9975, help="Enter latitude coordinate")
-with col2:
-    lon = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=73.7898, help="Enter longitude coordinate")
-
-# Training options
-st.sidebar.header("Training Options")
-use_enhanced_features = st.sidebar.checkbox("Use Enhanced Features", value=True, help="Include temporal and statistical features")
-show_training_metrics = st.sidebar.checkbox("Show Training Metrics", value=True, help="Display model performance metrics")
-
-if st.button("🚀 Train Accurate Model & Predict", type="primary"):
-    with st.spinner("Fetching historical weather data..."):
-        # Fetch more historical data for better training
-        df = fetch_nasa_data(lat, lon, start="20100101", end="20241231")
+def create_location_search_ui():
+    """Create the location search interface"""
+    st.subheader("📍 Location Search")
     
-    if df.empty:
-        st.error("❌ No NASA data available for this location. Please check coordinates.")
-    else:
-        st.success(f"✅ Fetched {len(df)} days of historical data")
+    # Location input methods
+    search_method = st.radio(
+        "Choose search method:",
+        ["🔍 Search by City/Address", "📍 Enter Coordinates Manually"],
+        horizontal=True
+    )
+    
+    if search_method == "🔍 Search by City/Address":
+        col1, col2 = st.columns([3, 1])
         
-        with st.spinner("Training accurate LSTM model (this may take a few minutes)..."):
-            # Train the accurate model
-            model, scaler, feature_cols, metrics, history = train_lstm(df)
-        
-        st.success("✅ Model training completed!")
-        
-        # Display training metrics
-        if show_training_metrics:
-            st.subheader("📊 Model Performance Metrics")
-            
-            # Create metrics dataframe
-            metrics_df = pd.DataFrame(metrics).T
-            metrics_df = metrics_df.round(4)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Average MAE", f"{metrics_df['MAE'].mean():.3f}")
-            with col2:
-                st.metric("Average R²", f"{metrics_df['R2'].mean():.3f}")
-            with col3:
-                st.metric("Features Used", len(feature_cols))
-            
-            # Show detailed metrics
-            st.dataframe(metrics_df, use_container_width=True)
-            
-            # Plot training history
-            if history:
-                st.subheader("📈 Training History")
-                hist_df = pd.DataFrame(history.history)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.line_chart(hist_df[['loss', 'val_loss']])
-                with col2:
-                    st.line_chart(hist_df[['mae', 'val_mae']])
-
-        # Fetch recent data for prediction
-        with st.spinner("Fetching recent data for prediction..."):
-            recent_df = fetch_nasa_data(lat, lon,
-                                        start=(datetime.today()-timedelta(days=400)).strftime("%Y%m%d"),
-                                        end=datetime.today().strftime("%Y%m%d"))
-        
-        if len(recent_df) < 30:
-            st.error("❌ Not enough recent data for prediction")
-        else:
-            with st.spinner("Generating 30-day weather forecast..."):
-                pred_df_display, pred_df_full = predict_next_30days(model, scaler, recent_df, feature_cols)
-            
-            st.success("✅ Weather forecast generated!")
-            
-            # Display predictions
-            st.subheader("🌤️ Predicted Weather for Next 30 Days")
-            
-            # Summary statistics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                avg_temp = pred_df_display["Temperature (°C)"].mean()
-                st.metric("Avg Temperature", f"{avg_temp:.1f}°C")
-            with col2:
-                avg_humidity = pred_df_display["Humidity (%)"].mean()
-                st.metric("Avg Humidity", f"{avg_humidity:.1f}%")
-            with col3:
-                total_precip = pred_df_display["Precipitation (mm)"].sum()
-                st.metric("Total Precipitation", f"{total_precip:.1f}mm")
-            with col4:
-                max_wind = pred_df_display["Wind Speed (m/s)"].max()
-                st.metric("Max Wind Speed", f"{max_wind:.1f}m/s")
-            
-            # Interactive data table
-            st.dataframe(pred_df_display, use_container_width=True)
-            
-            # Enhanced visualizations
-            st.subheader("📊 Weather Trends")
-            
-            # Temperature and Humidity
-            col1, col2 = st.columns(2)
-            with col1:
-                st.line_chart(pred_df_display.set_index("Date")[["Temperature (°C)"]], height=300)
-            with col2:
-                st.line_chart(pred_df_display.set_index("Date")[["Humidity (%)"]], height=300)
-            
-            # Wind and Precipitation
-            col1, col2 = st.columns(2)
-            with col1:
-                st.line_chart(pred_df_display.set_index("Date")[["Wind Speed (m/s)"]], height=300)
-            with col2:
-                st.bar_chart(pred_df_display.set_index("Date")[["Precipitation (mm)"]], height=300)
-            
-            # Combined plot
-            st.subheader("🌡️ Complete Weather Overview")
-            st.line_chart(pred_df_display.set_index("Date"), height=400)
-            
-            # Weather insights
-            st.subheader("🔍 Weather Insights")
-            
-            # Temperature insights
-            temp_trend = "increasing" if pred_df_display["Temperature (°C)"].iloc[-1] > pred_df_display["Temperature (°C)"].iloc[0] else "decreasing"
-            st.write(f"• Temperature trend: {temp_trend} over the next 30 days")
-            
-            # Precipitation insights
-            rainy_days = (pred_df_display["Precipitation (mm)"] > 1).sum()
-            st.write(f"• Expected rainy days: {rainy_days} out of 30 days")
-            
-            # Wind insights
-            windy_days = (pred_df_display["Wind Speed (m/s)"] > 5).sum()
-            st.write(f"• Expected windy days: {windy_days} out of 30 days")
-            
-            # Download option
-            csv = pred_df_display.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Forecast as CSV",
-                data=csv,
-                file_name=f"weather_forecast_{lat}_{lon}_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
+        with col1:
+            location_input = st.text_input(
+                "Enter city, address, or landmark:",
+                placeholder="e.g., New York, London, Tokyo, 1600 Pennsylvania Avenue",
+                help="You can search for cities, addresses, landmarks, or any location name"
             )
+        
+        with col2:
+            st.markdown("**Google Maps API** (Optional)")
+            google_api_key = st.text_input(
+                "API Key:",
+                type="password",
+                help="Enter your Google Maps API key for more accurate results"
+            )
+        
+        if st.button("🔍 Search Location", type="primary"):
+            if location_input:
+                with st.spinner("Searching for location..."):
+                    result, error = geocode_location(location_input, google_api_key if google_api_key else None)
+                
+                if error:
+                    st.error(error)
+                elif result:
+                    st.success(f"✅ Found: {result['display_name']}")
+                    st.session_state['selected_location'] = result
+                    st.session_state['lat'] = result['lat']
+                    st.session_state['lon'] = result['lon']
+                    st.session_state['location_name'] = result['display_name']
+                else:
+                    st.error("❌ Location not found. Please try a different search term.")
+            else:
+                st.warning("⚠️ Please enter a location to search.")
+    
+    else:  # Manual coordinates
+        col1, col2 = st.columns(2)
+        with col1:
+            lat = st.number_input(
+                "Latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                value=19.9975,
+                format="%.4f",
+                help="Enter latitude coordinate (-90 to 90)"
+            )
+        with col2:
+            lon = st.number_input(
+                "Longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                value=73.7898,
+                format="%.4f",
+                help="Enter longitude coordinate (-180 to 180)"
+            )
+        
+        if st.button("📍 Use These Coordinates", type="primary"):
+            st.session_state['lat'] = lat
+            st.session_state['lon'] = lon
+            st.session_state['location_name'] = f"Custom Location ({lat:.4f}, {lon:.4f})"
+            st.success(f"✅ Location set to {lat:.4f}, {lon:.4f}")
+    
+    # Display selected location
+    if 'selected_location' in st.session_state or ('lat' in st.session_state and 'lon' in st.session_state):
+        lat = st.session_state.get('lat')
+        lon = st.session_state.get('lon')
+        location_name = st.session_state.get('location_name', 'Selected Location')
+        
+        st.markdown("---")
+        st.subheader("🗺️ Selected Location")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.write(f"**Location:** {location_name}")
+            st.write(f"**Coordinates:** {lat:.4f}°N, {lon:.4f}°E")
+            
+            # Create and display map
+            try:
+                map_obj = create_location_map(lat, lon, location_name)
+                st_folium(map_obj, width=600, height=400)
+            except Exception as e:
+                st.warning(f"⚠️ Could not display map: {str(e)}")
+        
+        with col2:
+            st.markdown("**Location Details**")
+            if 'selected_location' in st.session_state:
+                location_data = st.session_state['selected_location']
+                if 'address' in location_data:
+                    address = location_data['address']
+                    if isinstance(address, dict):
+                        for key, value in address.items():
+                            if value and key in ['city', 'state', 'country', 'postcode']:
+                                st.write(f"**{key.title()}:** {value}")
+                    elif isinstance(address, list):
+                        for component in address[:3]:  # Show first 3 components
+                            if 'long_name' in component:
+                                st.write(f"• {component['long_name']}")
+            
+            # Quick actions
+            if st.button("🔄 Change Location"):
+                for key in ['selected_location', 'lat', 'lon', 'location_name']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+        
+        return lat, lon, location_name
+    
+    return None, None, None
+
+def create_weather_summary_cards(df):
+    """Create summary metric cards"""
+    if df.empty:
+        return
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        avg_temp = df["Temperature (°C)"].mean()
+        temp_change = df['Temperature (°C)'].iloc[-1] - df['Temperature (°C)'].iloc[0]
+        st.metric(
+            label="🌡️ Avg Temperature", 
+            value=f"{avg_temp:.1f}°C",
+            delta=f"{temp_change:+.1f}°C"
+        )
+    
+    with col2:
+        avg_humidity = df["Humidity (%)"].mean()
+        humidity_change = df['Humidity (%)'].iloc[-1] - df['Humidity (%)'].iloc[0]
+        st.metric(
+            label="💧 Avg Humidity", 
+            value=f"{avg_humidity:.1f}%",
+            delta=f"{humidity_change:+.1f}%"
+        )
+    
+    with col3:
+        total_precip = df["Precipitation (mm)"].sum()
+        max_precip = df['Precipitation (mm)'].max()
+        st.metric(
+            label="🌧️ Total Precipitation", 
+            value=f"{total_precip:.1f}mm",
+            delta=f"{max_precip:.1f}mm max"
+        )
+    
+    with col4:
+        max_wind = df["Wind Speed (m/s)"].max()
+        avg_wind = df['Wind Speed (m/s)'].mean()
+        st.metric(
+            label="💨 Max Wind Speed", 
+            value=f"{max_wind:.1f}m/s",
+            delta=f"{avg_wind:.1f}m/s avg"
+        )
+
+def create_interactive_charts(df):
+    """Create interactive weather charts"""
+    if df.empty:
+        return
+    
+    # Temperature and Humidity Chart
+    fig1 = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Temperature Trend', 'Humidity Trend'),
+        vertical_spacing=0.1
+    )
+    
+    fig1.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Temperature (°C)'],
+            mode='lines+markers',
+            name='Temperature',
+            line=dict(color='#FF6B6B', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.1f}°C<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    fig1.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Humidity (%)'],
+            mode='lines+markers',
+            name='Humidity',
+            line=dict(color='#4ECDC4', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.1f}%<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    
+    fig1.update_layout(
+        height=500,
+        showlegend=True,
+        hovermode='x unified',
+        title="Temperature and Humidity Trends"
+    )
+    
+    st.plotly_chart(fig1, use_container_width=True)
+    
+    # Wind and Precipitation Chart
+    fig2 = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Wind Speed', 'Precipitation'),
+        vertical_spacing=0.1
+    )
+    
+    fig2.add_trace(
+        go.Scatter(
+            x=df['Date'], 
+            y=df['Wind Speed (m/s)'],
+            mode='lines+markers',
+            name='Wind Speed',
+            line=dict(color='#45B7D1', width=3),
+            marker=dict(size=6),
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.2f} m/s<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    fig2.add_trace(
+        go.Bar(
+            x=df['Date'], 
+            y=df['Precipitation (mm)'],
+            name='Precipitation',
+            marker_color='#96CEB4',
+            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Value: %{y:.2f} mm<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    
+    fig2.update_layout(
+        height=500,
+        showlegend=True,
+        hovermode='x unified',
+        title="Wind Speed and Precipitation"
+    )
+    
+    st.plotly_chart(fig2, use_container_width=True)
+
+def create_weather_insights(df, location_name="this location"):
+    """Generate weather insights and recommendations"""
+    if df.empty:
+        return
+    
+    st.subheader("🔍 Weather Insights & Recommendations")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**📊 Weather Analysis**")
+        
+        # Temperature analysis
+        temp_trend = "increasing" if df["Temperature (°C)"].iloc[-1] > df["Temperature (°C)"].iloc[0] else "decreasing"
+        temp_change = abs(df["Temperature (°C)"].iloc[-1] - df["Temperature (°C)"].iloc[0])
+        st.write(f"• Temperature trend: **{temp_trend}** by {temp_change:.1f}°C over the period")
+        
+        # Precipitation analysis
+        rainy_days = (df["Precipitation (mm)"] > 1).sum()
+        heavy_rain_days = (df["Precipitation (mm)"] > 10).sum()
+        st.write(f"• Expected rainy days: **{rainy_days}** out of {len(df)} days")
+        if heavy_rain_days > 0:
+            st.write(f"• Heavy rain expected: **{heavy_rain_days}** days")
+        
+        # Wind analysis
+        windy_days = (df["Wind Speed (m/s)"] > 5).sum()
+        very_windy_days = (df["Wind Speed (m/s)"] > 10).sum()
+        st.write(f"• Windy days: **{windy_days}** days")
+        if very_windy_days > 0:
+            st.write(f"• Very windy days: **{very_windy_days}** days")
+    
+    with col2:
+        st.markdown("**💡 Recommendations**")
+        
+        # Temperature recommendations
+        avg_temp = df["Temperature (°C)"].mean()
+        if avg_temp > 30:
+            st.write("• 🌡️ **Hot weather expected** - Stay hydrated and avoid outdoor activities during peak hours")
+        elif avg_temp < 10:
+            st.write("• 🧥 **Cold weather expected** - Dress warmly and be prepared for low temperatures")
+        else:
+            st.write("• 🌤️ **Moderate temperatures** - Pleasant weather conditions expected")
+        
+        # Precipitation recommendations
+        if rainy_days > len(df) * 0.3:
+            st.write("• ☔ **Frequent rain expected** - Keep umbrellas and rain gear handy")
+        elif rainy_days > 0:
+            st.write("• 🌦️ **Some rain expected** - Check weather before outdoor plans")
+        else:
+            st.write("• ☀️ **Dry period expected** - Good time for outdoor activities")
+        
+        # Wind recommendations
+        if very_windy_days > 0:
+            st.write("• 💨 **Strong winds expected** - Secure outdoor items and avoid high-altitude activities")
+        elif windy_days > len(df) * 0.3:
+            st.write("• 🌬️ **Frequent windy conditions** - Consider wind when planning outdoor activities")
+
+# -------------------------------
+# Main App
+# -------------------------------
+def main():
+    # Header
+    st.title("🌦️ RainCheck - Interactive Weather Forecast")
+    st.markdown("**Real-time weather predictions powered by LSTM neural networks**")
+    
+    # API Status Check
+    api_status = check_api_status()
+    if not api_status:
+        st.error(f"⚠️ API server is not running. Please start the API server first:\n```bash\nuvicorn api:app --reload\n```")
+        st.stop()
+    else:
+        st.success("✅ API server is running")
+    
+    # Sidebar Configuration
+    st.sidebar.header("⚙️ Configuration")
+    
+    # API URL Configuration
+    api_url = st.sidebar.text_input(
+        "API Base URL", 
+        value=API_BASE_URL,
+        help="Enter the base URL of your weather forecast API"
+    )
+    
+    # Forecast Options
+    st.sidebar.header("📅 Forecast Options")
+    forecast_days = st.sidebar.selectbox(
+        "Forecast Period",
+        options=[7, 29],
+        index=1,
+        help="Select the number of days to forecast"
+    )
+    
+    # Display Options
+    st.sidebar.header("📊 Display Options")
+    show_charts = st.sidebar.checkbox("Show Interactive Charts", value=True)
+    show_insights = st.sidebar.checkbox("Show Weather Insights", value=True)
+    show_raw_data = st.sidebar.checkbox("Show Raw Data Table", value=False)
+    
+    # Main Content
+    st.markdown("---")
+    
+    # Location Search
+    lat, lon, location_name = create_location_search_ui()
+    
+    if lat is not None and lon is not None:
+        st.markdown("---")
+        
+        # Forecast Section
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            st.subheader(f"🌤️ {forecast_days}-Day Weather Forecast")
+            st.markdown(f"**Location:** {location_name}")
+        
+        with col2:
+            if st.button("🔄 Refresh Forecast", type="primary"):
+                st.rerun()
+        
+        # Fetch and Display Forecast
+        with st.spinner(f"Fetching {forecast_days}-day weather forecast for {location_name}..."):
+            df, error = fetch_weather_forecast(lat, lon, forecast_days)
+        
+        if error:
+            st.error(error)
+            st.info("💡 **Troubleshooting Tips:**\n1. Ensure the API server is running\n2. Check the API URL in the sidebar\n3. Verify your internet connection")
+        elif df.empty:
+            st.warning("No forecast data available. Please check your location coordinates.")
+        else:
+            # Summary Cards
+            create_weather_summary_cards(df)
+            
+            # Interactive Charts
+            if show_charts:
+                st.subheader("📈 Interactive Weather Charts")
+                create_interactive_charts(df)
+            
+            # Weather Insights
+            if show_insights:
+                create_weather_insights(df, location_name)
+            
+            # Raw Data Table
+            if show_raw_data:
+                st.subheader("📋 Raw Forecast Data")
+                st.dataframe(
+                    df.style.format({
+                        'Temperature (°C)': '{:.1f}',
+                        'Humidity (%)': '{:.1f}',
+                        'Wind Speed (m/s)': '{:.2f}',
+                        'Precipitation (mm)': '{:.2f}'
+                    }),
+                    use_container_width=True
+                )
+            
+            # Download Options
+            st.subheader("📥 Download Forecast Data")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📊 Download as CSV",
+                    data=csv,
+                    file_name=f"weather_forecast_{location_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+            
+            with col2:
+                json_data = df.to_json(orient='records', date_format='iso')
+                st.download_button(
+                    label="📄 Download as JSON",
+                    data=json_data,
+                    file_name=f"weather_forecast_{location_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+    else:
+        st.info("👆 Please search for a location above to get started with weather forecasting!")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "**RainCheck Weather Forecast** | Powered by LSTM Neural Networks | "
+        f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+if __name__ == "__main__":
+    main()
